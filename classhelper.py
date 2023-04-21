@@ -118,8 +118,8 @@ class DayDietRec:
         Args:
             data (pd.dataframe): the recipes dataframe
 
-        Returns:
-            _type_: _description_
+        Returns:    
+           corpus_sorted: corpus of csv file
         """
         corpus_sorted = []
         for doc in data.parsed:
