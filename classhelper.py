@@ -5,8 +5,8 @@ from sklearn.feature_extraction.text import TfidfVectorizer
 from collections import defaultdict
 import numpy as np
 import pandas as pd
-
-
+from tqdm import tqdm
+import random
 class TfidfEmbeddingVectorizer(object):
     def __init__(self, model_cbow):
         """根据语料,在Word2Vec model的基础上加上Tf-idf属性,让推荐更准确。
@@ -75,8 +75,9 @@ class TfidfEmbeddingVectorizer(object):
 
 
 class user:  # user类
-    def __init__(self, need_nutrition=[], allergen=[]):
+    def __init__(self, need_nutrition=[],category=[],allergen=[]):
         self.allergen = allergen
+        self.category=category
         self.need_nutrition = need_nutrition
 
 
@@ -84,8 +85,7 @@ class family:
     def __init__(self, user_list=[]):
         self.user_list = user_list
         self.user_num = len(self.user_list)
-
-
+        
 class DayDietRec:
     def __init__(self, data_path, model_save_path):
         """init
@@ -96,7 +96,7 @@ class DayDietRec:
         """
         self.data = pd.read_csv(data_path)
         self.corpus = self.get_and_sort_corpus_ingredient(self.data)
-        # self.train_ingredient_model(model_save_path)
+        self.train_ingredient_model(model_save_path)
         self.model = self.load_ingredient_model(model_save_path)
 
     def get_ingredient(self, s):
@@ -136,7 +136,7 @@ class DayDietRec:
     def train_ingredient_model(self, save_path):
         print(f"Length of corpus: {len(self.corpus)}")
         model_cbow = Word2Vec(
-            self.corpus, sg=0, workers=8, window=self.get_window(self.corpus), min_count=1, vector_size=50
+            self.corpus, sg=0, workers=8, window=self.get_window(self.corpus), min_count=1, vector_size=128
         )
         model_cbow.save(save_path)
         print("Word2Vec model successfully trained !")
@@ -182,7 +182,7 @@ class DayDietRec:
                 temp = self.recipe_similarity(
                     meal[i], meal[j], tfidf_vec_model)
                 sum_similarity.append(temp)
-        return (np.array(sum_similarity).mean()+1)/2  # 计算这个套餐的平均相似度,映射到0-1
+        return (np.array(sum_similarity).mean()+2)  # 计算这个套餐的平均相似度,映射到0-2
 
     def get_nutrition_similarity(self, recipe_nutrition, user_need_nutrition):
         """compute the nutrition similarity
@@ -215,8 +215,33 @@ class DayDietRec:
             sum_similarity.append(self.recipe_similarity(
                 r, ingredients_list, tfidf_vec_model))
         return (np.array(sum_similarity).mean()+1)/2  # 映射到0-1
-
-    def get_meal_score(self, it, ingredients_list, the_family, tfidf_vec_model):
+    def get_category(self,s:str):
+        if s=='无':
+            return []
+        temp=s.split(';')
+        if '' in temp:
+            temp.remove('')
+        return temp
+    def user_recipe_score(self,u:user,ind:int): #for category score
+        score=1
+        more=self.get_category(self.data.more[ind])
+        less=self.get_category(self.data.less[ind])
+        no=self.get_category(self.data.no[ind])
+        for c in u.category:
+            if c in more:
+                score*=1.5
+            if c in less:
+                score*=0.5
+            if c in no:
+                score*=0.1
+        return score
+    def get_category_score(self,it,the_family:family):
+        score=[]
+        for user in the_family.user_list:
+            for i in it:
+                score.append(self.user_recipe_score(user,i))
+        return np.array(score).mean()
+    def get_meal_score(self, it, ingredients_list, the_family:family, tfidf_vec_model):
         """to compute a meal's score
 
         Args:
@@ -228,15 +253,15 @@ class DayDietRec:
         Returns:
             score (int) : the score of the combination of recipes
         """
-        user_need_nutrition = [0, 0, 0]  # 糖，热量，脂肪
-        allergen = []
-        for u in the_family.user_list:  # 将所有家庭成员的过敏原汇总
-            allergen.extend(u.allergen)
+        user_need_nutrition = [0, 0, 0]  # 糖，热量，脂肪      
+        for u in the_family.user_list:  # 将所有家庭成员的过敏原汇总         
             user_need_nutrition[0] += u.need_nutrition[0]  # 计算家庭成员所需的营养
             user_need_nutrition[1] += u.need_nutrition[1]
             user_need_nutrition[2] += u.need_nutrition[2]
         meal_nutrition = [0, 0, 0]  # 糖，热量，脂肪
-
+                
+        
+        
         meal = []
         for index in it:
             recipe_ingredient = self.get_ingredient(self.data['parsed'][index])
@@ -245,10 +270,6 @@ class DayDietRec:
             meal_nutrition[1] += float(self.data['reliang'][index][:-1])
             meal_nutrition[2] += float(self.data['zhifang'][index][:-1])
             # 将菜谱中的营养相加
-        for r in meal:  # 判断meal有没有用户过敏的食材，若有，直接0分
-            for ing in r:
-                if ing in allergen:
-                    return 0
 
         meal_score1 = self.mean_similarity_in_meal(
             meal, tfidf_vec_model)  # 做的菜中的平均相似度，越小越好
@@ -256,9 +277,9 @@ class DayDietRec:
             meal, ingredients_list, tfidf_vec_model)  # 做的菜和原料的相似度，越高越好
         meal_score3 = self.get_nutrition_similarity(
             meal_nutrition, user_need_nutrition)  # 计算用户所需营养和meal中的营养相似度
-
-        return meal_score2*meal_score3/meal_score1
-
+        meal_score4 = self.get_category_score(it,the_family)
+        return (meal_score2*meal_score3*meal_score4)/(meal_score1*meal_score1)
+    
     def get_topn_meals(self, ingredients, the_family, n=5, search_num=100):
         '''
             Parameters:
@@ -272,19 +293,36 @@ class DayDietRec:
                 获得前n个菜谱推荐
         '''
         search_recipes_num = 10  # 子搜索集合的菜谱数
-        search_num = 100
+        search_num = len(self.data)//search_recipes_num
+        max_son_search_num=100
         scores = []
-        for i in range(search_num):
+        allergen=[]
+        for u in the_family.user_list:  # 将所有家庭成员的过敏原汇总
+            allergen.extend(u.allergen)
+        for i in tqdm(range(search_num)):
             search_from = np.random.choice(
                 len(self.data), search_recipes_num, replace=False)  # 从所有菜谱中取一些菜谱作为子搜索区域
             itering = combinations(
                 search_from, the_family.user_num+1)  # 获得这些菜谱其中的所有组合
             itering = list(itering)
-            for it in itering:  # 在子搜索区域搜索
+            random.shuffle(itering) #打乱组合顺序，避免连续很多个组合差异不大
+            num=0
+            for it in itering:  # 在子搜索区域搜索   
+                ok=1
+                for ind in it:
+                    recipe_ingredient = self.get_ingredient(self.data['parsed'][ind])
+                    for ing in recipe_ingredient:
+                        if ing in allergen:
+                            ok=0
+                if ok==0:
+                    continue  
+                num+=1
+                if num>=max_son_search_num:  #别在一个子区域搜索太久
+                    break
                 score = self.get_meal_score(
                     it, ingredients, the_family, self.model)
                 scores.append((it, score))
-
+                
         print(f'选择 {len(scores)} 种组合')
         scores.sort(key=lambda x: x[1], reverse=True)
         scores = scores[:n]
