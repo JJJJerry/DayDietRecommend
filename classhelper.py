@@ -7,6 +7,9 @@ import numpy as np
 import pandas as pd
 from tqdm import tqdm
 import random
+import torch
+import datetime
+CUSTOM_WEIGHT={'score1':1,'score2':1,'score3':1,'score4':1,'score5':1,'score6':1}
 class TfidfEmbeddingVectorizer(object):
     def __init__(self, model_cbow):
         """根据语料,在Word2Vec model的基础上加上Tf-idf属性,让推荐更准确。
@@ -74,18 +77,38 @@ class TfidfEmbeddingVectorizer(object):
         return np.vstack([self.doc_average(doc) for doc in docs])
 
 
-class user:  # user类
-    def __init__(self, need_nutrition=[],category=[],allergen=[]):
+class User:  # user类
+    def __init__(self, need_nutrition=[],category=[],kouwei=[],allergen=[]):
         self.allergen = allergen
         self.category=category
+        self.kouwei=kouwei
         self.need_nutrition = need_nutrition
 
 
-class family:
-    def __init__(self, user_list=[]):
+class Family:
+    def __init__(self, user_list=[],weight_dic=CUSTOM_WEIGHT):
         self.user_list = user_list
         self.user_num = len(self.user_list)
-        
+        self.weight_dic=weight_dic
+        self.check_weight()
+    def check_weight(self):
+        sum_weight=0
+        for v in self.weight_dic.values():
+            sum_weight+=v
+        for k in self.weight_dic.keys():
+            self.weight_dic[k]/=sum_weight #归一化
+class Score:
+    def __init__(self,score_dic:dict):
+        assert len(score_dic.keys())==7
+        self.score_dic=score_dic
+    def __lt__(self,other): #重写排序函数   
+        return self.score_dic['final_score']<other.score_dic['final_score']
+class Result:
+    def __init__(self,score:Score,it:tuple):
+        self.score=score
+        self.it=it
+    def __lt__(self,other): #重写排序函数   
+        return self.score>other.score
 class DayDietRec:
     def __init__(self, data_path, model_save_path):
         """init
@@ -98,7 +121,27 @@ class DayDietRec:
         self.corpus = self.get_and_sort_corpus_ingredient(self.data)
         self.train_ingredient_model(model_save_path)
         self.model = self.load_ingredient_model(model_save_path)
-
+        self.recipe_category_emb=torch.nn.Embedding(len(self.data),64)
+        self.recipe_category_emb.load_state_dict(torch.load('recipe_category_emb.emb'))
+        self.user_category_emb=torch.nn.Embedding(5,64)
+        self.user_category_emb.load_state_dict(torch.load('user_category_emb.emb'))
+        
+        self.recipe_kouwei_emb=torch.nn.Embedding(len(self.data),128)
+        self.recipe_kouwei_emb.load_state_dict(torch.load('recipe_kouwei_emb.emb'))
+        self.user_kouwei_emb=torch.nn.Embedding(20,128)
+        self.user_kouwei_emb.load_state_dict(torch.load('user_kouwei_emb.emb'))
+        self.time_food=self.get_time_food('time.txt')
+        
+        print('推荐系统初始化成功!')
+    def get_time_food(self,path):
+        dic={}
+        f=open(path,'r',encoding='utf-8')
+        lines=f.readlines()
+        for line in lines:
+            food,date=line.split()
+            dic[food]=date
+        f.close()
+        return dic
     def get_ingredient(self, s):
         """parser the str to get the ingredients list
         Args:
@@ -182,7 +225,7 @@ class DayDietRec:
                 temp = self.recipe_similarity(
                     meal[i], meal[j], tfidf_vec_model)
                 sum_similarity.append(temp)
-        return (np.array(sum_similarity).mean()+2)  # 计算这个套餐的平均相似度,映射到0-2
+        return 1-(np.array(sum_similarity).mean()+1)/2  # 计算这个套餐的平均相似度,映射到0-1
 
     def get_nutrition_similarity(self, recipe_nutrition, user_need_nutrition):
         """compute the nutrition similarity
@@ -198,7 +241,7 @@ class DayDietRec:
         user_need_nutrition = np.array(user_need_nutrition)
         cos_sim = cosine_similarity(recipe_nutrition.reshape(
             1, -1), user_need_nutrition.reshape(1, -1))
-        return cos_sim[0][0]
+        return (cos_sim[0][0]+1)/2 #映射到0-1
 
     def similarity_of_meal_and_ingredients(self, meal, ingredients_list, tfidf_vec_model):
         """compute the similarity of the combination of recipes with the ingredients
@@ -222,26 +265,78 @@ class DayDietRec:
         if '' in temp:
             temp.remove('')
         return temp
-    def user_recipe_score(self,u:user,ind:int): #for category score
-        score=1
-        more=self.get_category(self.data.more[ind])
-        less=self.get_category(self.data.less[ind])
-        no=self.get_category(self.data.no[ind])
+    @torch.no_grad()
+    def user_category_score(self,u:User,ind:int): #for category score
+        if u.category==[]:
+            return 0.5
+        user_emb=[]
         for c in u.category:
-            if c in more:
-                score*=1.5
-            if c in less:
-                score*=0.5
-            if c in no:
-                score*=0.1
+            assert type(c)==int
+            user_emb.append(self.user_category_emb(torch.tensor(c,dtype=torch.long)))
+        user_emb=torch.vstack(user_emb).mean(axis=0)
+        recipe_emb=self.recipe_category_emb(torch.tensor([ind],dtype=torch.long))     
+        user_emb_normed=torch.nn.functional.normalize(user_emb.unsqueeze(0))
+        recipe_emb_normed=torch.nn.functional.normalize(recipe_emb)
+        score=torch.mul(user_emb_normed,recipe_emb_normed).sum().numpy() #score是[-1,1]
+        score=(score+1)/2 #映射到0-1
         return score
-    def get_category_score(self,it,the_family:family):
+    def get_category_score(self,it,the_family:Family):
         score=[]
         for user in the_family.user_list:
             for i in it:
-                score.append(self.user_recipe_score(user,i))
+                score.append(self.user_category_score(user,i))
         return np.array(score).mean()
-    def get_meal_score(self, it, ingredients_list, the_family:family, tfidf_vec_model):
+    
+    
+    @torch.no_grad()
+    def user_kouwei_score(self,u:User,ind:int): #for category score
+        if u.kouwei==[]:
+            return 0.5
+        user_kouwei_emb=[]
+        for c in u.kouwei:
+            assert type(c)==int
+            user_kouwei_emb.append(self.user_kouwei_emb(torch.tensor(c,dtype=torch.long)))
+            
+        user_kouwei_emb=torch.vstack(user_kouwei_emb).mean(axis=0)
+        recipe_kouwei_emb=self.recipe_kouwei_emb(torch.tensor([ind],dtype=torch.long))
+        
+        user_kouwei_emb_normed=torch.nn.functional.normalize(user_kouwei_emb.unsqueeze(0))
+        recipe_kouwei_emb_normed=torch.nn.functional.normalize(recipe_kouwei_emb)
+        score=torch.mul(user_kouwei_emb_normed,recipe_kouwei_emb_normed).sum().numpy() #score几乎是[-1,1]
+        score=(score+1)/2 #映射到0-1
+        return score
+   
+    def get_kouwei_score(self,it,the_family:Family):
+        score=[]
+        for user in the_family.user_list:
+            for i in it:
+                score.append(self.user_kouwei_score(user,i))
+        return np.array(score).mean()
+    def compute_time_score(self,ingredient_list):
+        score_list=[]
+        for ing in ingredient_list:
+            score=0.5
+            if ing in self.time_food.keys():
+                a=min(datetime.date.today().month,int(self.time_food[ing]))
+                b=max(datetime.date.today().month,int(self.time_food[ing]))
+                distance=min(b-a,a+12-b)
+                score=(6-distance)/6
+            score_list.append(score)
+        return np.array(score_list).mean()
+    def get_time_score(self,it):
+        score=[]
+        for ind in it:
+            ingredient_list=self.get_ingredient(self.data.parsed[ind])
+            score.append(self.compute_time_score(ingredient_list))
+        return np.array(score).mean()
+    def compute_final_score(self,score_dic:dict,weight_dic:dict):
+        final_score=0.0
+        for k,v in score_dic.items():      
+            final_score+=v*weight_dic[k]
+        return final_score
+    
+        
+    def get_meal_score(self, it, ingredients_list, the_family:Family, tfidf_vec_model):
         """to compute a meal's score
 
         Args:
@@ -253,8 +348,10 @@ class DayDietRec:
         Returns:
             score (int) : the score of the combination of recipes
         """
-        user_need_nutrition = [0, 0, 0]  # 糖，热量，脂肪      
-        for u in the_family.user_list:  # 将所有家庭成员的过敏原汇总         
+        user_need_nutrition = [0, 0, 0]  # 糖，热量，脂肪
+        for u in the_family.user_list:  # 将所有家庭成员的过敏原汇总      
+            if u.need_nutrition==[]:
+                continue      
             user_need_nutrition[0] += u.need_nutrition[0]  # 计算家庭成员所需的营养
             user_need_nutrition[1] += u.need_nutrition[1]
             user_need_nutrition[2] += u.need_nutrition[2]
@@ -270,16 +367,31 @@ class DayDietRec:
             meal_nutrition[1] += float(self.data['reliang'][index][:-1])
             meal_nutrition[2] += float(self.data['zhifang'][index][:-1])
             # 将菜谱中的营养相加
-
+        
+        score_dic={}
         meal_score1 = self.mean_similarity_in_meal(
-            meal, tfidf_vec_model)  # 做的菜中的平均相似度，越小越好
+            meal, tfidf_vec_model)  # meal的食材搭配合理性（不重复度）0-1
         meal_score2 = self.similarity_of_meal_and_ingredients(
-            meal, ingredients_list, tfidf_vec_model)  # 做的菜和原料的相似度，越高越好
+            meal, ingredients_list, tfidf_vec_model)  # 做的菜和原料的相似度，越高越好  食材契合（度）
         meal_score3 = self.get_nutrition_similarity(
-            meal_nutrition, user_need_nutrition)  # 计算用户所需营养和meal中的营养相似度
-        meal_score4 = self.get_category_score(it,the_family)
-        return (meal_score2*meal_score3*meal_score4)/(meal_score1*meal_score1)
-    
+            meal_nutrition, user_need_nutrition)  # 计算用户所需营养和meal中的营养相似度  营养结构（契合度） 
+        meal_score4 = self.get_category_score(it,the_family)  # 用户类别得分  特殊需求           
+        
+        meal_score5=self.get_time_score(it)                      # 季节时令得分 季节时令
+        meal_score6=self.get_kouwei_score(it,the_family)       # 饮食偏好
+        
+        
+        score_dic['score1']=meal_score1
+        score_dic['score2']=meal_score2
+        score_dic['score3']=meal_score3
+        score_dic['score4']=meal_score4
+        score_dic['score5']=meal_score5
+        score_dic['score6']=meal_score6
+        
+        
+        score_dic['final_score']=self.compute_final_score(score_dic,the_family.weight_dic)
+        return Score(score_dic)
+        #return (meal_score2*meal_score3*meal_score4)/(meal_score1*meal_score1)
     def get_topn_meals(self, ingredients, the_family, n=5, search_num=100):
         '''
             Parameters:
@@ -292,10 +404,11 @@ class DayDietRec:
             Returns:
                 获得前n个菜谱推荐
         '''
-        search_recipes_num = 10  # 子搜索集合的菜谱数
+        search_recipes_num =30   # 子搜索集合的菜谱数
         search_num = len(self.data)//search_recipes_num
         max_son_search_num=100
-        scores = []
+        
+        results=[]
         allergen=[]
         for u in the_family.user_list:  # 将所有家庭成员的过敏原汇总
             allergen.extend(u.allergen)
@@ -321,19 +434,27 @@ class DayDietRec:
                     break
                 score = self.get_meal_score(
                     it, ingredients, the_family, self.model)
-                scores.append((it, score))
-                
-        print(f'选择 {len(scores)} 种组合')
-        scores.sort(key=lambda x: x[1], reverse=True)
-        scores = scores[:n]
-
-        res = pd.DataFrame(columns=['name', 'score'])
+                results.append(Result(score,it))
+        
+        
+        
+        print(f'选择 {len(results)} 种组合')
+        results=sorted(results)
+        results = results[:n]
+        res = pd.DataFrame(columns=['name', 'final_score','score1','score2','score3','score4','score5','score6'])
         count = 0
-        for score in scores:
+        for result in results:
             name = ''
-            for index in score[0]:
+            for index in result.it:
                 name += self.data['name'][index]+' '
             res.at[count, 'name'] = name
-            res.at[count, 'score'] = score[1]
+            res.at[count, 'final_score'] = result.score.score_dic['final_score']
+            res.at[count, 'score1'] = result.score.score_dic['score1']
+            res.at[count, 'score2'] = result.score.score_dic['score2']
+            res.at[count, 'score3'] = result.score.score_dic['score3']
+            res.at[count, 'score4'] = result.score.score_dic['score4']
+            res.at[count, 'score5'] = result.score.score_dic['score5']
+            res.at[count, 'score6'] = result.score.score_dic['score6']
+
             count += 1
         return res
